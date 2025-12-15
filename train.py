@@ -13,37 +13,27 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import DiffusionGPTConfig, DiffusionGPT
-from diffusion import MaskSchedule, q_sample_mask
+from diffusion import MaskSchedule, q_sample_mask, q_reveal_mask
 
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _has_working_triton() -> bool:
-    """
-    torch.compile(..., backend="inductor") typically requires Triton on CUDA.
-    On Windows, Triton is often unavailable, so prefer an eager fallback.
-    """
     try:
-        import triton  # type: ignore  # noqa: F401
-
+        import triton
         return True
-    except Exception:
+    except ImportError:
         return False
 
 
 def _resolve_dataset_dir(dataset_name: str, data_dir_override: str) -> str:
-    """
-    Resolve the directory containing train.bin/val.bin (and optionally meta.pkl).
-
-    By default this looks under diffusionGPT/data/<dataset>/, making diffusionGPT
-    self-contained. For backward compatibility, it also falls back to the legacy
-    nanoGPT/data/<dataset>/ location if present.
-    """
+    """Resolve the directory containing train.bin/val.bin (and optionally meta.pkl)."""
 
     if data_dir_override:
         return os.path.abspath(data_dir_override)
@@ -71,7 +61,7 @@ log_interval = 10
 eval_iters = 200
 eval_only = False
 always_save_checkpoint = False
-init_from = "scratch"  # 'scratch' or 'resume'
+init_from = "scratch"
 
 # wandb logging
 wandb_log = False
@@ -79,8 +69,8 @@ wandb_project = "diffusiongpt"
 wandb_run_name = "run"
 
 # data
-dataset = "shakespeare_char"  # expects diffusionGPT/data/<dataset>/{train,val}.bin by default
-data_dir = ""  # optional: override the dataset directory path
+dataset = "shakespeare_char"
+data_dir = ""
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256
@@ -89,12 +79,26 @@ block_size = 256
 diffusion_steps = 200
 mask_schedule = "linear"  # linear|cosine|pow
 mask_schedule_power = 1.0
+exact_masked_tokens = False 
+denoise_loss = "reveal"  # masked|reveal
+loss_reduction = "token"  # token|example
+# Optional weighting across timesteps to avoid collapsing to the unigram solution.
+# - inverse_mask_ratio balances examples with different numbers of masked tokens.
+# - 1_minus_mask_ratio emphasizes low-noise (more-context) examples.
+# - snr combines both (stronger bias to low-noise).
+loss_weighting = "none"  # none|1_minus_mask_ratio|inverse_mask_ratio|snr
+ensure_min_masked_tokens = 8  # 0 disables; helps avoid degenerate batches at small t
+ensure_min_revealed_tokens = 16  # only used when denoise_loss='reveal'
+# Timestep sampling distribution. Biasing toward small t often helps the model
+# learn to use context before mastering very-high-noise denoising.
+t_sampling = "pow"  # uniform|pow
+t_sampling_power = 2.0
 
 # model
 n_layer = 6
 n_head = 6
 n_embd = 384
-dropout = 0.2
+dropout = 0.0
 bias = False
 
 # adamw optimizer
@@ -102,7 +106,7 @@ learning_rate = 1e-3
 max_iters = 5000
 weight_decay = 1e-1
 beta1 = 0.9
-beta2 = 0.99
+beta2 = 0.95
 grad_clip = 1.0
 
 # learning rate decay settings
@@ -172,6 +176,20 @@ torch.backends.cudnn.allow_tf32 = True
 device_type = "cuda" if "cuda" in device else "cpu"
 ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
 ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+if device_type == "cpu" and not torch.cuda.is_available():
+    cuda_build = getattr(torch.version, "cuda", None)
+    if cuda_build is None:
+        print(
+            "NOTE: CUDA is not available; this looks like a CPU-only PyTorch build "
+            f"(torch.__version__={torch.__version__}). Install a CUDA-enabled torch to use GPU."
+        )
+    else:
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        extra = f", CUDA_VISIBLE_DEVICES={cuda_visible_devices!r}" if cuda_visible_devices is not None else ""
+        print(
+            "NOTE: CUDA is not available (torch.version.cuda="
+            f"{cuda_build!r}{extra}). If you expected GPU, check NVIDIA drivers/CUDA runtime."
+        )
 print(f"using device: {device} ({device_type}), dtype: {dtype}")
 
 # -----------------------------------------------------------------------------
@@ -212,6 +230,76 @@ else:
     print("no meta.pkl found, defaulting vocab_size to 50257 (GPT-2 BPE)")
 
 schedule = MaskSchedule(kind=mask_schedule, power=mask_schedule_power)
+
+# timestep sampling
+def sample_timesteps(batch_size: int, device: torch.device) -> torch.Tensor:
+    if t_sampling == "uniform":
+        return torch.randint(1, diffusion_steps + 1, (batch_size,), device=device)
+    if t_sampling == "pow":
+        if float(t_sampling_power) <= 0:
+            raise ValueError("t_sampling_power must be > 0 for t_sampling='pow'")
+        u = torch.rand((batch_size,), device=device)
+        t = (u.pow(float(t_sampling_power)) * float(diffusion_steps)).to(dtype=torch.long) + 1
+        return t.clamp_(1, diffusion_steps)
+    raise ValueError(f"Unknown t_sampling: {t_sampling}")
+
+
+def loss_weights(t: torch.Tensor) -> torch.Tensor:
+    """
+    Per-example weights w(t) used by the training objective.
+
+    We clamp very small mask ratios to 1/T to avoid extreme weights with cosine schedules.
+    """
+
+    mask_ratio = schedule.mask_ratio(t, diffusion_steps=diffusion_steps)  # (B,)
+    min_ratio = 1.0 / float(diffusion_steps)
+    ratio = mask_ratio.clamp_min(min_ratio)
+
+    if loss_weighting == "none":
+        return torch.ones_like(mask_ratio, dtype=torch.float32, device=t.device)
+    if loss_weighting == "1_minus_mask_ratio":
+        return (1.0 - mask_ratio).clamp_min(min_ratio).to(dtype=torch.float32)
+    if loss_weighting == "inverse_mask_ratio":
+        return (1.0 / ratio).to(dtype=torch.float32)
+    if loss_weighting == "snr":
+        return ((1.0 - mask_ratio).clamp_min(min_ratio) / ratio).to(dtype=torch.float32)
+    raise ValueError(f"Unknown loss_weighting: {loss_weighting}")
+
+
+def compute_loss(logits: torch.Tensor, targets: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """
+    Compute diffusion denoising loss on masked positions (targets != -1).
+
+    Supports:
+    - loss_reduction='token': average across masked tokens (optionally weighted by w(t))
+    - loss_reduction='example': average per example (optionally weighted by w(t))
+    """
+
+    per_token = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        targets.view(-1),
+        ignore_index=-1,
+        reduction="none",
+    ).view_as(targets)
+    mask = targets.ne(-1)
+
+    if loss_reduction == "token":
+        if loss_weighting == "none":
+            denom = mask.sum().clamp_min(1)
+            return (per_token * mask).sum() / denom
+        w = loss_weights(t).to(dtype=per_token.dtype)[:, None]  # (B, 1)
+        denom = (mask * w).sum().clamp_min(1)
+        return (per_token * mask * w).sum() / denom
+
+    if loss_reduction == "example":
+        denom = mask.sum(dim=1).clamp_min(1)
+        per_example = (per_token * mask).sum(dim=1) / denom
+        if loss_weighting == "none":
+            return per_example.mean()
+        w = loss_weights(t).to(dtype=per_example.dtype)
+        return (per_example * w).sum() / w.sum().clamp_min(1e-8)
+
+    raise ValueError(f"Unknown loss_reduction: {loss_reduction}")
 
 # model init
 model_args = dict(
@@ -261,7 +349,7 @@ if init_from == "resume":
     if "scaler" in checkpoint:
         try:
             scaler.load_state_dict(checkpoint["scaler"])
-        except Exception as e:
+        except (KeyError, ValueError, RuntimeError) as e:
             print(f"WARNING: could not load GradScaler state, continuing without it: {e}")
 checkpoint = None
 
@@ -274,11 +362,6 @@ if compile and device_type == "cuda" and not _has_working_triton():
 
 if compile:
     print("compiling the model... (takes a ~minute)")
-    # If inductor hits an unsupported pattern or backend issue, prefer eager fallback.
-    import torch._dynamo
-
-    torch._dynamo.config.suppress_errors = True
-    unoptimized_model = model
     model = torch.compile(model)
 
 if ddp:
@@ -295,16 +378,33 @@ def estimate_loss() -> dict[str, torch.Tensor]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             x0 = get_batch(split)
-            t = torch.randint(1, diffusion_steps + 1, (x0.size(0),), device=x0.device)
-            xt, targets, _ = q_sample_mask(
+            t = sample_timesteps(x0.size(0), x0.device)
+            xt, targets_x0, masked_at_t = q_sample_mask(
                 x0,
                 t,
                 mask_token_id=raw_model.mask_token_id,
                 diffusion_steps=diffusion_steps,
                 schedule=schedule,
+                min_masked_tokens=ensure_min_masked_tokens,
+                exact_masked_tokens=exact_masked_tokens,
             )
+            if denoise_loss == "masked":
+                targets = targets_x0
+            elif denoise_loss == "reveal":
+                reveal = q_reveal_mask(
+                    masked_at_t,
+                    t,
+                    diffusion_steps=diffusion_steps,
+                    schedule=schedule,
+                    min_revealed_tokens=ensure_min_revealed_tokens,
+                )
+                targets = x0.clone()
+                targets[~reveal] = -1
+            else:
+                raise ValueError(f"Unknown denoise_loss: {denoise_loss}")
             with ctx:
-                _, loss = model(xt, t, targets=targets)
+                logits, _ = model(xt, t, targets=None)
+                loss = compute_loss(logits, targets, t)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -370,22 +470,49 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    # lightweight stats for debugging the noise distribution
+    t_mean = 0.0
+    mask_ratio_mean = 0.0
+    masked_tokens_mean = 0.0
+    predicted_tokens_mean = 0.0
+
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
 
         # sample diffusion timestep per example
-        t = torch.randint(1, diffusion_steps + 1, (x0.size(0),), device=x0.device)
-        xt, targets, _ = q_sample_mask(
+        t = sample_timesteps(x0.size(0), x0.device)
+        xt, targets_x0, masked_at_t = q_sample_mask(
             x0,
             t,
             mask_token_id=raw_model.mask_token_id,
             diffusion_steps=diffusion_steps,
             schedule=schedule,
+            min_masked_tokens=ensure_min_masked_tokens,
+            exact_masked_tokens=exact_masked_tokens,
         )
+        if denoise_loss == "masked":
+            targets = targets_x0
+        elif denoise_loss == "reveal":
+            reveal = q_reveal_mask(
+                masked_at_t,
+                t,
+                diffusion_steps=diffusion_steps,
+                schedule=schedule,
+                min_revealed_tokens=ensure_min_revealed_tokens,
+            )
+            targets = x0.clone()
+            targets[~reveal] = -1
+        else:
+            raise ValueError(f"Unknown denoise_loss: {denoise_loss}")
+        t_mean += float(t.float().mean().item())
+        mask_ratio_mean += float(schedule.mask_ratio(t, diffusion_steps=diffusion_steps).mean().item())
+        masked_tokens_mean += float(masked_at_t.sum(dim=1).float().mean().item())
+        predicted_tokens_mean += float(targets.ne(-1).sum(dim=1).float().mean().item())
 
         with ctx:
-            _, loss = model(xt, t, targets=targets)
+            logits, _ = model(xt, t, targets=None)
+            loss = compute_loss(logits, targets, t)
             loss = loss / gradient_accumulation_steps
 
         x0 = get_batch("train")
@@ -404,10 +531,19 @@ while True:
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
         lossf = loss.item() * gradient_accumulation_steps
+        denom = float(gradient_accumulation_steps)
+        t_mean_print = t_mean / denom
+        mask_ratio_print = mask_ratio_mean / denom
+        masked_tokens_print = masked_tokens_mean / denom
+        predicted_tokens_print = predicted_tokens_mean / denom
         if local_iter_num >= 5:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(
+            f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}% "
+            f"(t_mean {t_mean_print:.1f}, mask_ratio {mask_ratio_print:.3f}, "
+            f"masked {masked_tokens_print:.1f}, pred {predicted_tokens_print:.1f})"
+        )
 
     iter_num += 1
     local_iter_num += 1

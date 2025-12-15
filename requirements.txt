@@ -1,0 +1,14 @@
+# Core
+# Install a CUDA-enabled PyTorch build from https://pytorch.org/get-started/locally/ if you want GPU training.
+torch>=2.0
+numpy>=1.26
+
+# Tokenization (needed for GPT-2 BPE datasets / sampling without meta.pkl)
+tiktoken>=0.5
+
+# OpenWebText dataset preparation
+datasets>=2.16
+tqdm>=4.66
+
+# Optional experiment tracking (used when `wandb_log=True`)
+wandb>=0.16

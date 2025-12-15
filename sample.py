@@ -3,15 +3,13 @@ Sample from a trained DiffusionGPT checkpoint using MaskGIT-style iterative deco
 """
 
 import os
+import sys
 import math
+import time
 import pickle
 from contextlib import nullcontext
 
 import torch
-try:
-    import tiktoken  # type: ignore
-except Exception:  # pragma: no cover
-    tiktoken = None
 
 from model import DiffusionGPTConfig, DiffusionGPT
 from diffusion import MaskSchedule
@@ -21,13 +19,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _resolve_dataset_dir(dataset_name: str, data_dir_override: str) -> str:
-    """
-    Resolve the directory containing (optional) meta.pkl for encoding/decoding.
-
-    By default this looks under diffusionGPT/data/<dataset>/, making diffusionGPT
-    self-contained. For backward compatibility, it also falls back to the legacy
-    nanoGPT/data/<dataset>/ location if present.
-    """
+    """Resolve the directory containing meta.pkl for encoding/decoding."""
 
     if data_dir_override:
         return os.path.abspath(data_dir_override)
@@ -47,21 +39,26 @@ def _resolve_dataset_dir(dataset_name: str, data_dir_override: str) -> str:
     )
 
 # -----------------------------------------------------------------------------
-init_from = "resume"  # 'resume'
-out_dir = "out-diffusion"  # contains ckpt.pt
-data_dir = ""  # optional: override dataset directory for meta.pkl lookup
+init_from = "resume"
+out_dir = "out-diffusion"
+data_dir = ""
 
-start = "\n"  # prompt, or "FILE:prompt.txt"
+start = "\n"
 num_samples = 5
-max_new_tokens = 256  # number of generated tokens after prompt (clipped to block_size)
+max_new_tokens = 256
 
 temperature = 1.0
 top_k = 200
 sample = True  # if False, uses argmax (deterministic)
 
-mask_schedule = "linear"
+animate = False
+animate_delay = 0.05
+animate_step = 1
+mask_char = "_"
+
+mask_schedule = "auto"  # auto|linear|cosine|pow
 mask_schedule_power = 1.0
-diffusion_steps = 0  # 0 = use checkpoint diffusion_steps
+diffusion_steps = 0
 
 seed = 1337
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,6 +87,20 @@ torch.backends.cudnn.allow_tf32 = True
 device_type = "cuda" if "cuda" in device else "cpu"
 ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
 ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+if device_type == "cpu" and not torch.cuda.is_available():
+    cuda_build = getattr(torch.version, "cuda", None)
+    if cuda_build is None:
+        print(
+            "NOTE: CUDA is not available; this looks like a CPU-only PyTorch build "
+            f"(torch.__version__={torch.__version__}). Install a CUDA-enabled torch to use GPU."
+        )
+    else:
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        extra = f", CUDA_VISIBLE_DEVICES={cuda_visible_devices!r}" if cuda_visible_devices is not None else ""
+        print(
+            "NOTE: CUDA is not available (torch.version.cuda="
+            f"{cuda_build!r}{extra}). If you expected GPU, check NVIDIA drivers/CUDA runtime."
+        )
 print(f"using device: {device} ({device_type}), dtype: {dtype}")
 
 # -----------------------------------------------------------------------------
@@ -111,6 +122,11 @@ model.eval()
 model.to(device)
 if compile:
     model = torch.compile(model)
+
+ckpt_cfg = checkpoint.get("config", {})
+if mask_schedule == "auto":
+    mask_schedule = ckpt_cfg.get("mask_schedule", "linear")
+    mask_schedule_power = float(ckpt_cfg.get("mask_schedule_power", 1.0))
 
 T = diffusion_steps if diffusion_steps > 0 else model.config.diffusion_steps
 schedule = MaskSchedule(kind=mask_schedule, power=mask_schedule_power)
@@ -149,11 +165,13 @@ else:
             "If this is a character-level dataset, run `python diffusionGPT/data/<dataset>/prepare.py` "
             "and ensure meta.pkl is alongside train.bin/val.bin, or pass --data_dir=..."
         )
-    if tiktoken is None:
+    try:
+        import tiktoken
+    except ImportError:
         raise SystemExit(
             "tiktoken is required to sample GPT-2 BPE checkpoints when meta.pkl is not available.\n"
             "Install with: pip install tiktoken"
-        )
+        ) from None
     print("No meta.pkl found, assuming GPT-2 encodings...")
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
@@ -175,29 +193,53 @@ def sample_from_logits(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     if temperature != 1.0:
         logits = logits / temperature
 
-    if top_k is not None:
+    if top_k is not None and int(top_k) > 0:
         k = min(int(top_k), logits.size(-1))
         v, ix = torch.topk(logits, k=k, dim=-1)
         probs = torch.softmax(v, dim=-1)
         flat_probs = probs.view(-1, k)
         sampled = torch.multinomial(flat_probs, num_samples=1).view(logits.size(0), logits.size(1))
         tokens = ix.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-        # exact confidence under full softmax (not truncated)
         logZ = torch.logsumexp(logits, dim=-1)
         chosen = logits.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
         confidence = torch.exp(chosen - logZ)
         return tokens, confidence
 
-    tokens = torch.argmax(logits, dim=-1)
+    probs = torch.softmax(logits, dim=-1)
+    flat_probs = probs.view(-1, probs.size(-1))
+    tokens = torch.multinomial(flat_probs, num_samples=1).view(logits.size(0), logits.size(1))
     logZ = torch.logsumexp(logits, dim=-1)
     chosen = logits.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     confidence = torch.exp(chosen - logZ)
     return tokens, confidence
 
 
+def decode_with_mask(ids: list[int], mask_token_id: int, decoder, mask_display: str = "_") -> str:
+    """Decode token ids, replacing mask tokens with a visible character."""
+    result = []
+    for i in ids:
+        if i == mask_token_id:
+            result.append(mask_display)
+        else:
+            result.append(decoder([i]))
+    return "".join(result)
+
+
+def clear_line():
+    """Clear the current line in terminal."""
+    sys.stdout.write("\033[2K\033[G")
+    sys.stdout.flush()
+
+
+def move_cursor_up(n: int):
+    """Move cursor up n lines."""
+    if n > 0:
+        sys.stdout.write(f"\033[{n}A")
+        sys.stdout.flush()
+
+
 @torch.no_grad()
-def generate_one(prompt: list[int]) -> list[int]:
-    # choose length (prompt + max_new_tokens, but not exceeding block_size)
+def generate_one(prompt: list[int], decoder=None, show_animation: bool = False) -> list[int]:
     prompt = prompt[-model.config.block_size :]
     prompt_len = len(prompt)
     seq_len = min(model.config.block_size, prompt_len + int(max_new_tokens))
@@ -209,28 +251,34 @@ def generate_one(prompt: list[int]) -> list[int]:
     if seq_len == prompt_len:
         return x[0].tolist()
 
-    # boolean mask for prompt positions (never changed or re-masked)
     prompt_mask = torch.zeros((1, seq_len), dtype=torch.bool, device=device)
     prompt_mask[:, :prompt_len] = True
+
+    prev_lines = 0
 
     for t in range(T, 0, -1):
         t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
         with ctx:
             logits, _ = model(x, t_tensor)
 
+        masked = (x == model.mask_token_id) & (~prompt_mask)
         if sample:
-            tokens, confidence = sample_from_logits(logits)
+            sampled_tokens, _ = sample_from_logits(logits)
         else:
-            tokens = torch.argmax(logits / temperature, dim=-1)
-            logZ = torch.logsumexp(logits / temperature, dim=-1)
-            chosen = (logits / temperature).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
-            confidence = torch.exp(chosen - logZ)
+            scaled_logits = logits / temperature if temperature != 1.0 else logits
+            sampled_tokens = torch.argmax(scaled_logits, dim=-1)
 
-        # keep prompt fixed
-        tokens[prompt_mask] = x[prompt_mask]
+        tokens = torch.where(masked, sampled_tokens, x)
+
+        if prompt_len:
+            tokens[0, :prompt_len] = torch.tensor(prompt, dtype=torch.long, device=device)
+
+        scaled_logits = logits / temperature if temperature != 1.0 else logits
+        logZ = torch.logsumexp(scaled_logits, dim=-1)
+        chosen = scaled_logits.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+        confidence = torch.exp(chosen - logZ)
         confidence[prompt_mask] = float("inf")
 
-        # re-mask lowest-confidence positions to match next mask ratio
         n_gen = seq_len - prompt_len
         if n_gen <= 0:
             x = tokens
@@ -238,6 +286,19 @@ def generate_one(prompt: list[int]) -> list[int]:
 
         if t == 1:
             x = tokens
+            if show_animation and decoder is not None:
+                n_masked = 0
+                mask_ratio_pct = 0.0
+                display_text = decode_with_mask(x[0].tolist(), model.mask_token_id, decoder, mask_char)
+                move_cursor_up(prev_lines)
+                lines = display_text.split('\n')
+                header = f"[t={t:3d}/{T}] {mask_ratio_pct:5.1f}% masked"
+                print(header)
+                for line in lines:
+                    clear_line()
+                    print(line)
+                prev_lines = len(lines) + 1
+                time.sleep(animate_delay)
             continue
 
         next_ratio = float(schedule.mask_ratio(torch.tensor(t - 1), diffusion_steps=T).item())
@@ -246,7 +307,6 @@ def generate_one(prompt: list[int]) -> list[int]:
             x = tokens
             continue
 
-        # select positions to (re)mask
         scores = confidence.clone()
         scores[prompt_mask] = float("inf")
         mask_idx = torch.topk(-scores, k=n_mask_next, dim=1).indices
@@ -256,11 +316,32 @@ def generate_one(prompt: list[int]) -> list[int]:
         if prompt_len:
             x[0, :prompt_len] = torch.tensor(prompt, dtype=torch.long, device=device)
 
+        if show_animation and decoder is not None and t % animate_step == 0:
+            n_masked = (x == model.mask_token_id).sum().item()
+            mask_ratio_pct = 100.0 * n_masked / seq_len
+            display_text = decode_with_mask(x[0].tolist(), model.mask_token_id, decoder, mask_char)
+
+            move_cursor_up(prev_lines)
+
+            lines = display_text.split('\n')
+            header = f"[t={t:3d}/{T}] {mask_ratio_pct:5.1f}% masked"
+            print(header)
+            for line in lines:
+                clear_line()
+                print(line)
+            prev_lines = len(lines) + 1
+
+            time.sleep(animate_delay)
+
     return x[0].tolist()
 
 
 with torch.no_grad():
-    for _ in range(num_samples):
-        ids = generate_one(prompt_ids)
-        print(decode(ids))
+    for i in range(num_samples):
+        if animate:
+            print(f"\n=== Sample {i+1}/{num_samples} ===")
+            print()
+        ids = generate_one(prompt_ids, decoder=decode, show_animation=animate)
+        if not animate:
+            print(decode(ids))
         print("---------------")

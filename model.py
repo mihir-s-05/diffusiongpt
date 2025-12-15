@@ -109,7 +109,7 @@ class Block(nn.Module):
 @dataclass
 class DiffusionGPTConfig:
     block_size: int = 256
-    vocab_size: int = 50257  # size of the *base* vocabulary (no mask token)
+    vocab_size: int = 50257
     diffusion_steps: int = 200
     n_layer: int = 6
     n_head: int = 6

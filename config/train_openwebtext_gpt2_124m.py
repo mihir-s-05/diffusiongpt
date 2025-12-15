@@ -23,6 +23,12 @@ block_size = 1024
 
 diffusion_steps = 200
 mask_schedule = "cosine"
+denoise_loss = "reveal"
+ensure_min_revealed_tokens = 32
+loss_reduction = "token"
+loss_weighting = "none"
+t_sampling = "uniform"
+t_sampling_power = 1.0
 
 n_layer = 12
 n_head = 12
