@@ -62,39 +62,36 @@ def q_sample_mask(
         t = t.expand(x0.size(0))
     assert t.shape == (x0.size(0),)
 
-    mask_ratio = schedule.mask_ratio(t, diffusion_steps=diffusion_steps)  # (B,)
+    bsz, seq_len = x0.shape
+    mask_ratio = schedule.mask_ratio(t, diffusion_steps=diffusion_steps)
 
     if exact_masked_tokens:
-        # Mask exactly k_i ~= mask_ratio(t_i) * seq_len tokens per example.
-        bsz, seq_len = x0.shape
-        mask = torch.zeros((bsz, seq_len), device=x0.device, dtype=torch.bool)
-        for i in range(bsz):
-            k = int(round(float(mask_ratio[i].item()) * seq_len))
-            k = max(int(min_masked_tokens), k)
-            k = min(k, seq_len)
-            if k <= 0:
-                continue
-            perm = torch.randperm(seq_len, device=x0.device, generator=generator)
-            mask[i, perm[:k]] = True
+        k = (mask_ratio * seq_len).round().to(torch.long)
+        k = k.clamp(min=min_masked_tokens, max=seq_len)
+
+        noise = torch.rand((bsz, seq_len), device=x0.device, generator=generator)
+        sorted_indices = noise.argsort(dim=1)
+        positions = torch.arange(seq_len, device=x0.device).unsqueeze(0)
+        mask = positions < k.unsqueeze(1)
+        mask_final = torch.zeros((bsz, seq_len), device=x0.device, dtype=torch.bool)
+        mask_final.scatter_(1, sorted_indices, mask)
+        mask = mask_final
     else:
         noise = torch.rand(x0.shape, device=x0.device, generator=generator)
         mask = noise < mask_ratio[:, None]
         if min_masked_tokens > 0:
-            # Ensure each sequence has at least `min_masked_tokens` masked positions.
-            # This avoids degenerate loss (e.g. all ignore_index) at very small mask ratios.
             masked_counts = mask.sum(dim=1)
-            for i in range(x0.size(0)):
-                need = int(min_masked_tokens) - int(masked_counts[i].item())
-                if need <= 0:
-                    continue
-                # If everything is already masked, there's nothing to do.
-                unmasked = (~mask[i]).nonzero(as_tuple=False).view(-1)
-                if unmasked.numel() == 0:
-                    continue
-                need = min(need, unmasked.numel())
-                perm = torch.randperm(unmasked.numel(), device=x0.device, generator=generator)
-                chosen = unmasked[perm[:need]]
-                mask[i, chosen] = True
+            need = (min_masked_tokens - masked_counts).clamp(min=0)
+
+            if need.any():
+                unmasked_noise = torch.rand((bsz, seq_len), device=x0.device, generator=generator)
+                unmasked_noise = unmasked_noise.masked_fill(mask, float('inf'))
+                sorted_indices = unmasked_noise.argsort(dim=1)
+                positions = torch.arange(seq_len, device=x0.device).unsqueeze(0)
+                additional_mask = positions < need.unsqueeze(1)
+                additional_final = torch.zeros((bsz, seq_len), device=x0.device, dtype=torch.bool)
+                additional_final.scatter_(1, sorted_indices, additional_mask)
+                mask = mask | additional_final
 
     xt = x0.masked_fill(mask, mask_token_id)
     targets = x0.clone()
@@ -130,30 +127,32 @@ def q_reveal_mask(
         t = t.expand(masked_at_t.size(0))
     assert t.shape == (masked_at_t.size(0),)
 
+    bsz, seq_len = masked_at_t.shape
     t = t.to(dtype=torch.long, device=masked_at_t.device)
     t_prev = (t - 1).clamp_min(0)
 
-    r_t = schedule.mask_ratio(t, diffusion_steps=diffusion_steps)  # (B,)
-    r_prev = schedule.mask_ratio(t_prev, diffusion_steps=diffusion_steps)  # (B,)
+    r_t = schedule.mask_ratio(t, diffusion_steps=diffusion_steps)
+    r_prev = schedule.mask_ratio(t_prev, diffusion_steps=diffusion_steps)
 
     r_t = r_t.clamp_min(1.0 / float(diffusion_steps))
-    reveal_p = ((r_t - r_prev).clamp_min(0.0) / r_t).clamp_(0.0, 1.0)  # (B,)
+    reveal_p = ((r_t - r_prev).clamp_min(0.0) / r_t).clamp_(0.0, 1.0)
 
     noise = torch.rand(masked_at_t.shape, device=masked_at_t.device, generator=generator)
     reveal = masked_at_t & (noise < reveal_p[:, None])
 
     if min_revealed_tokens > 0:
         revealed_counts = reveal.sum(dim=1)
-        for i in range(masked_at_t.size(0)):
-            need = int(min_revealed_tokens) - int(revealed_counts[i].item())
-            if need <= 0:
-                continue
-            candidates = (masked_at_t[i] & (~reveal[i])).nonzero(as_tuple=False).view(-1)
-            if candidates.numel() == 0:
-                continue
-            need = min(need, candidates.numel())
-            perm = torch.randperm(candidates.numel(), device=masked_at_t.device, generator=generator)
-            chosen = candidates[perm[:need]]
-            reveal[i, chosen] = True
+        need = (min_revealed_tokens - revealed_counts).clamp(min=0)
+
+        if need.any():
+            candidates_mask = masked_at_t & (~reveal)
+            candidate_noise = torch.rand((bsz, seq_len), device=masked_at_t.device, generator=generator)
+            candidate_noise = candidate_noise.masked_fill(~candidates_mask, float('inf'))
+            sorted_indices = candidate_noise.argsort(dim=1)
+            positions = torch.arange(seq_len, device=masked_at_t.device).unsqueeze(0)
+            additional_reveal = positions < need.unsqueeze(1)
+            additional_final = torch.zeros((bsz, seq_len), device=masked_at_t.device, dtype=torch.bool)
+            additional_final.scatter_(1, sorted_indices, additional_reveal)
+            reveal = reveal | (additional_final & candidates_mask)
 
     return reveal

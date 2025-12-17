@@ -81,8 +81,38 @@ python sample.py --out_dir=out-diffusion-shakespeare-char --start="ROMEO:" --max
 
 ## OpenWebText (GPT-2 BPE)
 
-After running `python data/openwebtext/prepare.py` (requires `pip install datasets tqdm`), you can start a GPT-2-sized diffusion run with:
+OpenWebText is raw web text. The prep script never executes it, but antivirus tools may still flag cached archives during download.
+
+After running `python data/openwebtext/prepare.py` (requires `pip install "datasets<4" tqdm`), you can start a GPT-2-sized diffusion run with:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py config/train_openwebtext_gpt2_124m.py
+```
+
+On Windows, the OpenWebText prep script defaults to a **streaming** path and uses an isolated cache under `data/openwebtext/_hf_cache` (deleted at the end). You can control it with env vars:
+
+- `OWT_STREAMING=1` (recommended) or `OWT_STREAMING=0`
+- `OWT_DELETE_CACHE=1` to delete the isolated cache after prep
+- `OWT_NUM_PROC=1` / `OWT_NUM_PROC_LOAD_DATASET=1` to reduce multiprocessing issues
+- `OWT_MAX_DOCS` / `OWT_MAX_TOKENS` to build a smaller dataset
+
+## WikiText-103 (GPT-2 BPE)
+
+If you'd like a more curated dataset than OpenWebText, WikiText-103 is a solid default:
+
+```bash
+python data/wikitext103/prepare.py
+```
+
+Training config options:
+
+```bash
+# Tiny / Shakespeare-sized model (good starting point on a single GPU)
+python train.py config/train_wikitext103_tiny.py
+
+# Larger model (still smaller than GPT-2 124M)
+python train.py config/train_wikitext103_gpt2_small.py
+
+# GPT-2 124M-sized model (requires more VRAM)
+python train.py config/train_wikitext103_gpt2_124m.py
 ```

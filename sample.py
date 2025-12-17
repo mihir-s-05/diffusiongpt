@@ -49,14 +49,14 @@ max_new_tokens = 256
 
 temperature = 1.0
 top_k = 200
-sample = True  # if False, uses argmax (deterministic)
+sample = True
 
 animate = False
 animate_delay = 0.05
 animate_step = 1
 mask_char = "_"
 
-mask_schedule = "auto"  # auto|linear|cosine|pow
+mask_schedule = "auto"
 mask_schedule_power = 1.0
 diffusion_steps = 0
 

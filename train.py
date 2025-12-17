@@ -54,7 +54,6 @@ def _resolve_dataset_dir(dataset_name: str, data_dir_override: str) -> str:
 
 # -----------------------------------------------------------------------------
 # defaults (override via config file and/or CLI: `--key=value`)
-# I/O
 out_dir = "out-diffusion"
 eval_interval = 250
 log_interval = 10
@@ -63,45 +62,34 @@ eval_only = False
 always_save_checkpoint = False
 init_from = "scratch"
 
-# wandb logging
 wandb_log = False
 wandb_project = "diffusiongpt"
 wandb_run_name = "run"
 
-# data
 dataset = "shakespeare_char"
 data_dir = ""
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256
 
-# diffusion
 diffusion_steps = 200
 mask_schedule = "linear"  # linear|cosine|pow
 mask_schedule_power = 1.0
 exact_masked_tokens = False 
-denoise_loss = "reveal"  # masked|reveal
-loss_reduction = "token"  # token|example
-# Optional weighting across timesteps to avoid collapsing to the unigram solution.
-# - inverse_mask_ratio balances examples with different numbers of masked tokens.
-# - 1_minus_mask_ratio emphasizes low-noise (more-context) examples.
-# - snr combines both (stronger bias to low-noise).
-loss_weighting = "none"  # none|1_minus_mask_ratio|inverse_mask_ratio|snr
-ensure_min_masked_tokens = 8  # 0 disables; helps avoid degenerate batches at small t
-ensure_min_revealed_tokens = 16  # only used when denoise_loss='reveal'
-# Timestep sampling distribution. Biasing toward small t often helps the model
-# learn to use context before mastering very-high-noise denoising.
-t_sampling = "pow"  # uniform|pow
+denoise_loss = "reveal" 
+loss_reduction = "token"
+loss_weighting = "none"
+ensure_min_masked_tokens = 8
+ensure_min_revealed_tokens = 16
+t_sampling = "pow"
 t_sampling_power = 2.0
 
-# model
 n_layer = 6
 n_head = 6
 n_embd = 384
 dropout = 0.0
 bias = False
 
-# adamw optimizer
 learning_rate = 1e-3
 max_iters = 5000
 weight_decay = 1e-1
@@ -109,24 +97,19 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
 
-# learning rate decay settings
 decay_lr = True
 warmup_iters = 100
 lr_decay_iters = 5000
 min_lr = 1e-4
 
-# DDP settings
 backend = "nccl" if torch.cuda.is_available() and torch.distributed.is_nccl_available() else "gloo"
 
-# system
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = (
     "bfloat16"
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     else ("float16" if torch.cuda.is_available() else "float32")
 )
-# torch.compile is great, but on Windows CUDA it commonly fails due to Triton.
-# Users can still override this via config/CLI.
 compile = torch.cuda.is_available() and os.name != "nt"
 # -----------------------------------------------------------------------------
 
@@ -173,6 +156,8 @@ if hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 device_type = "cuda" if "cuda" in device else "cpu"
 ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
 ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -200,11 +185,12 @@ print(f"using dataset dir: {dataset_dir}")
 
 
 def get_batch(split: str) -> torch.Tensor:
-    # recreate np.memmap every batch to avoid a memory leak
     filename = "train.bin" if split == "train" else "val.bin"
     data = np.memmap(os.path.join(dataset_dir, filename), dtype=np.uint16, mode="r")
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x0 = torch.stack([torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix])
+    x0 = torch.zeros((batch_size, block_size), dtype=torch.int64)
+    for j, i in enumerate(ix.tolist()):
+        x0[j] = torch.from_numpy(data[i : i + block_size].astype(np.int64))
     if device_type == "cuda":
         x0 = x0.pin_memory().to(device, non_blocking=True)
     else:
@@ -245,13 +231,9 @@ def sample_timesteps(batch_size: int, device: torch.device) -> torch.Tensor:
 
 
 def loss_weights(t: torch.Tensor) -> torch.Tensor:
-    """
-    Per-example weights w(t) used by the training objective.
+    """Per-example timestep weights w(t)."""
 
-    We clamp very small mask ratios to 1/T to avoid extreme weights with cosine schedules.
-    """
-
-    mask_ratio = schedule.mask_ratio(t, diffusion_steps=diffusion_steps)  # (B,)
+    mask_ratio = schedule.mask_ratio(t, diffusion_steps=diffusion_steps)
     min_ratio = 1.0 / float(diffusion_steps)
     ratio = mask_ratio.clamp_min(min_ratio)
 
@@ -287,7 +269,7 @@ def compute_loss(logits: torch.Tensor, targets: torch.Tensor, t: torch.Tensor) -
         if loss_weighting == "none":
             denom = mask.sum().clamp_min(1)
             return (per_token * mask).sum() / denom
-        w = loss_weights(t).to(dtype=per_token.dtype)[:, None]  # (B, 1)
+        w = loss_weights(t).to(dtype=per_token.dtype)[:, None]
         denom = (mask * w).sum().clamp_min(1)
         return (per_token * mask * w).sum() / denom
 
@@ -470,7 +452,6 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # lightweight stats for debugging the noise distribution
     t_mean = 0.0
     mask_ratio_mean = 0.0
     masked_tokens_mean = 0.0
@@ -480,7 +461,6 @@ while True:
         if ddp:
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
 
-        # sample diffusion timestep per example
         t = sample_timesteps(x0.size(0), x0.device)
         xt, targets_x0, masked_at_t = q_sample_mask(
             x0,

@@ -7,7 +7,9 @@ numpy>=1.26
 tiktoken>=0.5
 
 # OpenWebText dataset preparation
-datasets>=2.16
+# datasets>=4 removed support for "dataset scripts" (like OpenWebText's openwebtext.py),
+# which this repo's preparation script relies on.
+datasets>=2.16,<4
 tqdm>=4.66
 
 # Optional experiment tracking (used when `wandb_log=True`)

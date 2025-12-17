@@ -47,6 +47,14 @@ class SelfAttention(nn.Module):
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        else:
+            # Enable the most efficient SDPA backends available
+            if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+                torch.backends.cuda.enable_flash_sdp(True)
+            if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+            if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+                torch.backends.cuda.enable_math_sdp(True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, channels = x.size()

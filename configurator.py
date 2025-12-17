@@ -12,7 +12,6 @@ THIS_DIR = os.path.dirname(__file__)
 
 for arg in sys.argv[1:]:
     if "=" not in arg:
-        # assume it's the name of a config file
         assert not arg.startswith("--")
         config_file = arg
         if not os.path.exists(config_file):
@@ -22,7 +21,6 @@ for arg in sys.argv[1:]:
             print(f.read())
         exec(open(config_file, encoding="utf-8").read())
     else:
-        # assume it's a --key=value argument
         assert arg.startswith("--")
         key, val = arg.split("=", 1)
         key = key[2:]
