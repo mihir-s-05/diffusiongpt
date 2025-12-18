@@ -17,18 +17,18 @@ wandb_project = "diffusiongpt"
 wandb_run_name = "wikitext103-gpt2-small"
 
 dataset = "wikitext103"
-gradient_accumulation_steps = 64
-batch_size = 1
+gradient_accumulation_steps = 16
+batch_size = 8
 block_size = 256
 
-diffusion_steps = 200
+diffusion_steps = 500
 mask_schedule = "cosine"
 denoise_loss = "reveal"
 ensure_min_revealed_tokens = 16
 loss_reduction = "token"
-loss_weighting = "none"
-t_sampling = "uniform"
-t_sampling_power = 1.0
+loss_weighting = "snr"
+t_sampling = "pow"
+t_sampling_power = 2.0
 
 # Smaller than GPT-2 124M; fits better on 8GB GPUs at 256 context.
 n_layer = 8
@@ -41,11 +41,11 @@ learning_rate = 6e-4
 max_iters = 200000
 weight_decay = 1e-1
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.99
 grad_clip = 1.0
 
 decay_lr = True
-warmup_iters = 2000
+warmup_iters = 5000
 lr_decay_iters = 200000
 min_lr = 6e-5
 

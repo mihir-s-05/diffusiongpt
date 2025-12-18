@@ -21,15 +21,15 @@ gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256
 
-diffusion_steps = 200
+diffusion_steps = 500
 mask_schedule = "cosine"
 exact_masked_tokens = False
 denoise_loss = "masked"
 ensure_min_revealed_tokens = 16
 loss_reduction = "token"
-loss_weighting = "none"
-t_sampling = "uniform"
-t_sampling_power = 1.0
+loss_weighting = "snr"
+t_sampling = "pow"
+t_sampling_power = 2.0
 
 n_layer = 6
 n_head = 6
@@ -41,8 +41,8 @@ weight_decay = 1e-2
 max_iters = 5000
 lr_decay_iters = 5000
 min_lr = 6e-5
-beta2 = 0.95
-warmup_iters = 200
+beta2 = 0.99
+warmup_iters = 500
 
 # On CPU:
 # device = "cpu"

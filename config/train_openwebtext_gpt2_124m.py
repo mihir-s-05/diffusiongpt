@@ -17,18 +17,18 @@ wandb_project = "diffusiongpt"
 wandb_run_name = "owt-gpt2-124m"
 
 dataset = "openwebtext"
-gradient_accumulation_steps = 5 * 8
-batch_size = 12
+gradient_accumulation_steps = 16
+batch_size = 32
 block_size = 1024
 
-diffusion_steps = 200
+diffusion_steps = 500
 mask_schedule = "cosine"
 denoise_loss = "reveal"
 ensure_min_revealed_tokens = 32
 loss_reduction = "token"
-loss_weighting = "none"
-t_sampling = "uniform"
-t_sampling_power = 1.0
+loss_weighting = "snr"
+t_sampling = "pow"
+t_sampling_power = 2.0
 
 n_layer = 12
 n_head = 12
@@ -40,10 +40,10 @@ learning_rate = 6e-4
 max_iters = 600000
 weight_decay = 1e-1
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.99
 grad_clip = 1.0
 
 decay_lr = True
-warmup_iters = 2000
+warmup_iters = 10000
 lr_decay_iters = 600000
 min_lr = 6e-5

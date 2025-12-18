@@ -8,6 +8,7 @@ training loop with minimal indirection.
 import os
 import time
 import math
+import copy
 import pickle
 from contextlib import nullcontext
 
@@ -72,13 +73,13 @@ gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256
 
-diffusion_steps = 200
+diffusion_steps = 500
 mask_schedule = "linear"  # linear|cosine|pow
 mask_schedule_power = 1.0
 exact_masked_tokens = False 
 denoise_loss = "reveal" 
 loss_reduction = "token"
-loss_weighting = "none"
+loss_weighting = "snr"
 ensure_min_masked_tokens = 8
 ensure_min_revealed_tokens = 16
 t_sampling = "pow"
@@ -94,13 +95,15 @@ learning_rate = 1e-3
 max_iters = 5000
 weight_decay = 1e-1
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.99
 grad_clip = 1.0
 
 decay_lr = True
 warmup_iters = 100
 lr_decay_iters = 5000
 min_lr = 1e-4
+
+ema_decay = 0.9999
 
 backend = "nccl" if torch.cuda.is_available() and torch.distributed.is_nccl_available() else "gloo"
 
@@ -188,9 +191,8 @@ def get_batch(split: str) -> torch.Tensor:
     filename = "train.bin" if split == "train" else "val.bin"
     data = np.memmap(os.path.join(dataset_dir, filename), dtype=np.uint16, mode="r")
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x0 = torch.zeros((batch_size, block_size), dtype=torch.int64)
-    for j, i in enumerate(ix.tolist()):
-        x0[j] = torch.from_numpy(data[i : i + block_size].astype(np.int64))
+    ix_np = ix.numpy()
+    x0 = torch.stack([torch.from_numpy(data[i:i + block_size].astype(np.int64)) for i in ix_np])
     if device_type == "cuda":
         x0 = x0.pin_memory().to(device, non_blocking=True)
     else:
@@ -323,6 +325,11 @@ if block_size < model.config.block_size:
 
 model.to(device)
 
+ema_model = copy.deepcopy(model)
+ema_model.eval()
+for p in ema_model.parameters():
+    p.requires_grad_(False)
+
 scaler = torch.amp.GradScaler(device="cuda", enabled=(dtype == "float16" and device_type == "cuda"))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 
@@ -333,6 +340,8 @@ if init_from == "resume":
             scaler.load_state_dict(checkpoint["scaler"])
         except (KeyError, ValueError, RuntimeError) as e:
             print(f"WARNING: could not load GradScaler state, continuing without it: {e}")
+    if "ema_model" in checkpoint:
+        ema_model.load_state_dict(checkpoint["ema_model"])
 checkpoint = None
 
 if compile and device_type == "cuda" and not _has_working_triton():
@@ -355,7 +364,7 @@ if ddp:
 @torch.no_grad()
 def estimate_loss() -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
-    model.eval()
+    eval_model = ema_model
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
@@ -385,11 +394,10 @@ def estimate_loss() -> dict[str, torch.Tensor]:
             else:
                 raise ValueError(f"Unknown denoise_loss: {denoise_loss}")
             with ctx:
-                logits, _ = model(xt, t, targets=None)
+                logits, _ = eval_model(xt, t, targets=None)
                 loss = compute_loss(logits, targets, t)
             losses[k] = loss.item()
         out[split] = losses.mean()
-    model.train()
     return out
 
 
@@ -439,6 +447,7 @@ while True:
             if iter_num > 0:
                 checkpoint = {
                     "model": raw_model.state_dict(),
+                    "ema_model": ema_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict(),
                     "model_args": model_args,
@@ -505,6 +514,10 @@ while True:
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
+
+    with torch.no_grad():
+        for ema_p, model_p in zip(ema_model.parameters(), raw_model.parameters()):
+            ema_p.lerp_(model_p, 1.0 - ema_decay)
 
     t1 = time.time()
     dt = t1 - t0

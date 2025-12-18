@@ -22,14 +22,14 @@ gradient_accumulation_steps = 8
 batch_size = 8
 block_size = 256
 
-diffusion_steps = 200
+diffusion_steps = 500
 mask_schedule = "cosine"
 denoise_loss = "reveal"
 ensure_min_revealed_tokens = 16
 loss_reduction = "token"
-loss_weighting = "none"
-t_sampling = "uniform"
-t_sampling_power = 1.0
+loss_weighting = "snr"
+t_sampling = "pow"
+t_sampling_power = 2.0
 
 n_layer = 6
 n_head = 6
@@ -41,11 +41,11 @@ learning_rate = 6e-4
 max_iters = 100000
 weight_decay = 1e-1
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.99
 grad_clip = 1.0
 
 decay_lr = True
-warmup_iters = 1000
+warmup_iters = 3000
 lr_decay_iters = 100000
 min_lr = 6e-5
 

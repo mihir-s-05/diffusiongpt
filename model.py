@@ -118,7 +118,7 @@ class Block(nn.Module):
 class DiffusionGPTConfig:
     block_size: int = 256
     vocab_size: int = 50257
-    diffusion_steps: int = 200
+    diffusion_steps: int = 500
     n_layer: int = 6
     n_head: int = 6
     n_embd: int = 384

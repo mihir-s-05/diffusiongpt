@@ -8,6 +8,7 @@ __pycache__/
 venv/
 env/
 ENV/
+.venv-ws/
 
 # Packaging/build
 build/
@@ -17,6 +18,7 @@ dist/
 # IDE/editor
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store
